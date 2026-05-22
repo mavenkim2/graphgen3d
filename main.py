@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import objaverse.xl as oxl
 import trimesh
+import flash_attn
 
 
 class PointEmbed(nn.Module):
@@ -38,55 +39,80 @@ class PointEmbed(nn.Module):
         return self.proj(torch.cat((fourier_features, input), dim=2))
 
 
-class Attention(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=8, channels=64):
-        super().__init__()
-        """
-        self.apply_query_matrix = nn.Linear(input_dim, query_dim, bias=False)
-        self.apply_kv = nn.Linear(data_dim, query_dim + value_dim, bias=False)
-        self.query_dim=query_dim
-        scale = query_dim ** -0.5
-        """
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-
-        self.apply_attention = nn.MultiheadAttention(
-            embed_dim=self.embed_dim, num_heads=self.num_heads
-        )
-        # TODO: DropPath?
-
-    def forward(self, input, data) -> torch.Tensor:
-        q = self.apply_query_matrix(input)
-
-        # kv: [B, N, Dq + Dv]
-        kv = self.apply_kv(data)
-        k = kv[:, :, : self.query_dim]
-        v = kv[:, :, self.query_dim :]
-
-        # softmax(QKt / sqrt(Dq)) * V
-        attn = torch.softmax((q @ torch.transpose(k, -2, -1)) * self.scale, dim=-1)
-        out = attn @ v
-
-        return out
-
 class VAE(nn.Module):
     def __init__(self):
         super().__init__()
     def forward(self, input):
         pass
 
+class SelfMultiheadAttention(nn.Module):
+    def __init__(self, model_dim: int, num_heads: int, use_bias: bool = True):
+        super().__init__()
+
+        assert model_dim % num_heads == 0
+
+        self.num_heads = num_heads
+        self.to_qkv = nn.Linear(model_dim, 3 * model_dim, bias=use_bias)
+        self.to_result = nn.Linear(model_dim, model_dim, bias=use_bias)
+
+    def forward(self, input):
+        if input.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError(f"SelfMultiheadAttention expects fp16/bf16 input, got {input.dtype}")
+        if not input.is_cuda:
+            raise ValueError("flash-attn requires CUDA tensors")
+
+        batch_size, seq_len, channels = input.shape
+        qkv = self.to_qkv(input)
+        # qkv: (batch_size, seqlen, 3, nheads, headdim)
+        qkv = torch.reshape(qkv, (batch_size, seq_len, 3, self.num_heads, -1))
+        # out: (batch_size, seqlen, nheads, model_dim)
+        out = flash_attn.flash_attn_qkvpacked_func(qkv)
+        out = out.reshape(batch_size, seq_len, -1)
+        out = self.to_result(out)
+
+        return out
+
+class CrossMultiheadAttention(nn.Module):
+    def __init__(self, model_dim: int, num_heads: int, use_bias: bool = True):
+        super().__init__()
+
+        assert model_dim % num_heads == 0
+
+        self.num_heads = num_heads
+        self.use_bias = use_bias
+
+        self.to_q = nn.Linear(model_dim, model_dim, bias=use_bias)
+        self.to_kv = nn.Linear(model_dim, 2 * model_dim, bias=use_bias)
+        self.to_result = nn.Linear(model_dim, model_dim)
+
+    def forward(self, input: torch.Tensor, context):
+        if input.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError(f"CrossMultiheadAttention expects fp16/bf16 input, got {input.dtype}")
+        if context.dtype != input.dtype:
+            raise TypeError(f"context dtype must match input dtype, got {context.dtype} vs {input.dtype}")
+        if not input.is_cuda or not context.is_cuda:
+            raise ValueError("flash-attn requires CUDA tensors")
+
+        batch_size, seq_len, channels = input.shape
+        q = self.to_q(input)
+        kv = self.to_kv(context)
+        q = torch.reshape(q, (batch_size, seq_len, self.num_heads, -1))
+        kv = torch.reshape(kv, (batch_size, context.shape[1], 2, self.num_heads, -1))
+
+        out = flash_attn.flash_attn_kvpacked_func(q, kv)
+        out = out.reshape(batch_size, seq_len, -1)
+        out = self.to_result(out)
+
+        return out
+
 class DiffusionTransformerLayer(nn.Module):
     def __init__(self, model_dim=768, num_heads=12):
         super().__init__()
         assert model_dim % num_heads == 0
 
-        # TODO: use torch.nn.functional.scaled_dot_product_attention
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=model_dim, num_heads=num_heads, batch_first=True
-        )
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=model_dim, num_heads=num_heads, batch_first=True
-        )
+        self.num_heads = num_heads
+        self.self_attn = SelfMultiheadAttention(model_dim, num_heads)
+        self.cross_attn = CrossMultiheadAttention(model_dim, num_heads)
 
         self.norm0 = nn.LayerNorm(model_dim)
         self.norm1 = nn.LayerNorm(model_dim)
@@ -99,18 +125,16 @@ class DiffusionTransformerLayer(nn.Module):
         )
 
     def forward(self, z) -> torch.Tensor:
-        # z: B x N x 64
+        # z: B x N x D
         # TODO: go from 64 -> 768 before this layer
         normalized_input = self.norm0(z)
-        attn, _ = self.self_attn(
-            normalized_input, normalized_input, normalized_input, need_weights=False
-        )
+        attn = self.self_attn(normalized_input)
         output0 = attn + z
 
         # TODO: use a pretrained language model to get textual features c
         c = None
         x = self.norm1(output0)
-        attn, _ = self.cross_attn(x, c, c, need_weights=False)
+        attn = self.cross_attn(x, c)
         output1 = attn + output0
 
         x = self.norm2(output1)
@@ -121,7 +145,7 @@ class DiffusionTransformerLayer(nn.Module):
 
 class DiffusionTransformer(nn.Module):
     def __init__(self, model_dim=768, num_heads=12, model_channels=64):
-        super.__init__()
+        super().__init__()
         assert model_dim % num_heads == 0
 
         self.in_proj = nn.Linear(model_channels, model_dim)
