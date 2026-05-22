@@ -5,7 +5,7 @@ import numpy as np
 import objaverse.xl as oxl
 import trimesh
 import flash_attn
-
+import torch_cluster
 
 class PointEmbed(nn.Module):
     def __init__(self, num_frequencies=8, dim=128):
@@ -38,12 +38,6 @@ class PointEmbed(nn.Module):
         fourier_features = self.embed(input, self.fourier_basis)
         return self.proj(torch.cat((fourier_features, input), dim=2))
 
-
-class VAE(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, input):
-        pass
 
 class SelfMultiheadAttention(nn.Module):
     def __init__(self, model_dim: int, num_heads: int, use_bias: bool = True):
@@ -105,43 +99,92 @@ class CrossMultiheadAttention(nn.Module):
 
         return out
 
+class ResidualAttentionBlock(nn.Module):
+    def __init__(self, model_dim: int, num_heads: int, is_self: bool=False, context_dim: int=0, use_bias:bool=True,):
+        super().__init__()
+        self.is_self = is_self
+        self.norm = nn.LayerNorm(model_dim)
+        if self.is_self:
+            self.attn = SelfMultiheadAttention(model_dim, num_heads, use_bias)
+        else:
+            context_dim = model_dim if context_dim == 0 else context_dim
+            self.cross_norm = nn.LayerNorm(context_dim)
+            self.attn = CrossMultiheadAttention(model_dim, num_heads, use_bias) 
+    def forward(self, input, context=None):
+        x = self.norm(input)
+        if self.is_self:
+            x = self.attn(x)
+        else: 
+            assert context is not None
+            y = self.cross_norm(context)
+            x = self.attn(x, y)
+        x = input + x
+        return x
+
+
+class FeedForward(nn.Module):
+    def __init__(self, model_dim, mult: int=4):
+        super().__init__()
+        self.norm = nn.LayerNorm(model_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(model_dim, mult * model_dim),
+            nn.GELU(),
+            nn.Linear(mult * model_dim, model_dim)
+        )
+    def forward(self, input):
+        x = self.norm(input)
+        x = self.ffn(x)
+        x = x + input
+        return x
+
+
+class VAEGeometryEncoder(nn.Module):
+    def __init__(self, model_dim=512, num_heads=8):
+        super().__init__()
+        self.cross_attn_block = ResidualAttentionBlock(model_dim, num_heads, is_self=False)
+        self.ffn_block = FeedForward(model_dim)
+        self.positional_encoding = PointEmbed(dim=model_dim)
+
+    def forward(self, point_cloud):
+        ratio = 0.25
+
+        B, N, D = point_cloud.shape
+
+        flattened_point_cloud = point_cloud.view(B * N, D)
+        batch = torch.arange(B).to(point_cloud.device)
+        batch = torch.repeat_interleave(batch, N)
+        downsampled_pc_idx = torch_cluster.fps(src=flattened_point_cloud, batch=batch, ratio=ratio)
+        downsampled_pc = flattened_point_cloud[downsampled_pc_idx]
+        downsampled_pc = downsampled_pc.view(B, -1, 3)
+
+        encoded_pc = self.positional_encoding(point_cloud)
+        encoded_downsampled_pc = self.positional_encoding(downsampled_pc)
+
+        output = self.cross_attn_block(encoded_downsampled_pc, encoded_pc)
+        output = self.ffn_block(output)
+        return output
+
+
 class DiffusionTransformerLayer(nn.Module):
     def __init__(self, model_dim=768, num_heads=12):
         super().__init__()
         assert model_dim % num_heads == 0
 
-        self.num_heads = num_heads
-        self.self_attn = SelfMultiheadAttention(model_dim, num_heads)
-        self.cross_attn = CrossMultiheadAttention(model_dim, num_heads)
-
-        self.norm0 = nn.LayerNorm(model_dim)
-        self.norm1 = nn.LayerNorm(model_dim)
-        self.norm2 = nn.LayerNorm(model_dim)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(model_dim, 4 * model_dim),
-            nn.GELU(),
-            nn.Linear(4 * model_dim, model_dim),
-        )
+        self.self_attn_block = ResidualAttentionBlock(model_dim=model_dim, num_heads=num_heads, is_self=True)
+        self.cross_attn_block = ResidualAttentionBlock(model_dim=model_dim, num_heads=num_heads, is_self=False)
+        self.ffn_block = FeedForward(model_dim)
 
     def forward(self, z) -> torch.Tensor:
         # z: B x N x D
         # TODO: go from 64 -> 768 before this layer
-        normalized_input = self.norm0(z)
-        attn = self.self_attn(normalized_input)
-        output0 = attn + z
+        output = self.self_attn_block(z)
 
         # TODO: use a pretrained language model to get textual features c
         c = None
-        x = self.norm1(output0)
-        attn = self.cross_attn(x, c)
-        output1 = attn + output0
+        output = self.cross_attn_block(output, c)
+        output = self.ffn_block(output)
 
-        x = self.norm2(output1)
-        x = self.ffn(x)
-        output2 = x + output1
-
-        return output2
+        return output
 
 class DiffusionTransformer(nn.Module):
     def __init__(self, model_dim=768, num_heads=12, model_channels=64):
