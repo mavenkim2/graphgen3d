@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import objaverse.xl as oxl
 import trimesh
@@ -40,16 +41,18 @@ class PointEmbed(nn.Module):
 class Attention(nn.Module):
     def __init__(self, embed_dim=512, num_heads=8, channels=64):
         super().__init__()
-        '''
+        """
         self.apply_query_matrix = nn.Linear(input_dim, query_dim, bias=False)
         self.apply_kv = nn.Linear(data_dim, query_dim + value_dim, bias=False)
         self.query_dim=query_dim
         scale = query_dim ** -0.5
-        '''
+        """
         self.embed_dim = embed_dim
         self.num_heads = num_heads
 
-        self.apply_attention = nn.MultiheadAttention(embed_dim=self.embed_dim, num_heads=self.num_heads)
+        self.apply_attention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim, num_heads=self.num_heads
+        )
         # TODO: DropPath?
 
     def forward(self, input, data) -> torch.Tensor:
@@ -66,31 +69,42 @@ class Attention(nn.Module):
 
         return out
 
+class VAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, input):
+        pass
+
 class DiffusionTransformerLayer(nn.Module):
-    def __init__(self, model_dim=768, num_heads=12, model_channels=64):
+    def __init__(self, model_dim=768, num_heads=12):
         super().__init__()
         assert model_dim % num_heads == 0
 
-        self.self_attn = nn.MultiheadAttention(embed_dim=model_dim, num_heads=num_heads, batch_first=True)
-        self.cross_attn = nn.MultiheadAttention(embed_dim=model_dim, num_heads=num_heads, batch_first=True)
+        # TODO: use torch.nn.functional.scaled_dot_product_attention
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=model_dim, num_heads=num_heads, batch_first=True
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=model_dim, num_heads=num_heads, batch_first=True
+        )
 
         self.norm0 = nn.LayerNorm(model_dim)
         self.norm1 = nn.LayerNorm(model_dim)
         self.norm2 = nn.LayerNorm(model_dim)
 
-        #self.in_proj = nn.Linear(model_channels, model_dim)
-        #self.out_proj = nn.Linear(model_dim, model_channels)
         self.ffn = nn.Sequential(
-            nn.Linear(model_dim, 4 * model_dim), 
+            nn.Linear(model_dim, 4 * model_dim),
             nn.GELU(),
-            nn.Linear(4 * model_dim, model_dim)
+            nn.Linear(4 * model_dim, model_dim),
         )
 
     def forward(self, z) -> torch.Tensor:
         # z: B x N x 64
         # TODO: go from 64 -> 768 before this layer
         normalized_input = self.norm0(z)
-        attn, _ = self.self_attn(normalized_input, normalized_input, normalized_input, need_weights=False)
+        attn, _ = self.self_attn(
+            normalized_input, normalized_input, normalized_input, need_weights=False
+        )
         output0 = attn + z
 
         # TODO: use a pretrained language model to get textual features c
@@ -103,7 +117,14 @@ class DiffusionTransformerLayer(nn.Module):
         x = self.ffn(x)
         output2 = x + output1
 
-        return output2 
+        return output2
+
+class DiffusionTransformer(nn.Module):
+    def __init__(self, model_dim=768, num_heads=12, model_channels=64):
+        super.__init__()
+        assert model_dim % num_heads == 0
+
+        self.in_proj = nn.Linear(model_channels, model_dim)
 
 
 def main():
